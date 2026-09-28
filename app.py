@@ -95,6 +95,18 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":
                 self.db.authorize_region(int(parts[2]), str(body.get("region", "")))
                 return self._json(201, {"ok": True})
+            if parsed.path == "/api/schedule/lock":
+                lock = self.db.lock_schedule(
+                    str(body.get("air_date", "")), str(body.get("region", "")),
+                    str(body.get("operator", "")),
+                )
+                return self._json(201, {"ok": True, "lock": lock, "state": self.db.snapshot()})
+            if parsed.path == "/api/schedule/unlock":
+                result = self.db.unlock_schedule(
+                    str(body.get("air_date", "")), str(body.get("region", "")),
+                    str(body.get("operator", "")), str(body.get("reason", "")),
+                )
+                return self._json(200, {"ok": True, "lock": result, "state": self.db.snapshot()})
             self._json(404, {"ok": False, "error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})

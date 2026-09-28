@@ -119,6 +119,17 @@ class RadioDB:
               created_at TEXT NOT NULL,
               UNIQUE(air_date, slot_id, kind)
             );
+            CREATE TABLE IF NOT EXISTS schedule_lock_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              air_date TEXT NOT NULL,
+              region TEXT NOT NULL,
+              action TEXT NOT NULL CHECK(action IN ('locked','unlocked')),
+              operator TEXT NOT NULL,
+              reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lock_events_target
+              ON schedule_lock_events(air_date, region);
             """
         )
         self.conn.commit()
@@ -262,6 +273,7 @@ class RadioDB:
         if not program:
             raise DomainError("节目不存在")
         with self.transaction():
+            self._ensure_schedule_unlocked(air_date, region)
             self._validate_slot(air_date, start_time, int(program["duration_minutes"]), program_id, region)
             cur = self.conn.execute(
                 "INSERT INTO slots(air_date,start_time,duration_minutes,program_id,region,created_at) VALUES(?,?,?,?,?,?)",
@@ -275,6 +287,7 @@ class RadioDB:
             slot = self.conn.execute("SELECT * FROM slots WHERE id=? AND status='planned'", (slot_id,)).fetchone()
             if not slot:
                 raise DomainError("只能替换尚未播出且状态为 planned 的排期")
+            self._ensure_schedule_unlocked(slot["air_date"], slot["region"])
             program = self.conn.execute("SELECT * FROM programs WHERE id=?", (new_program_id,)).fetchone()
             if not program:
                 raise DomainError("替换节目不存在")
@@ -293,6 +306,102 @@ class RadioDB:
         if not row:
             raise DomainError("排期不存在")
         return dict(row)
+
+    def _validate_lock_target(self, air_date: str, region: str) -> None:
+        try:
+            datetime.strptime(air_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise DomainError("播出日期必须使用 YYYY-MM-DD") from exc
+        if not region.strip():
+            raise DomainError("地区不能为空")
+
+    def _ensure_schedule_unlocked(self, air_date: str, region: str) -> None:
+        lock = self.get_lock(air_date, region)
+        if lock:
+            raise DomainError(
+                f"{air_date} {region.strip()} 的节目单已锁定"
+                f"（{lock['operator']} 于 {lock['locked_at']} 锁定），原安排不能动；"
+                "如需调整请先解锁并填写原因"
+            )
+
+    def lock_schedule(self, air_date: str, region: str, operator: str) -> dict:
+        """Freeze an approved schedule for a date and region.
+
+        Re-locking after an unlock is allowed; every action is kept forever in
+        schedule_lock_events, and the most recent event defines the current state.
+        """
+        self._validate_lock_target(air_date, region)
+        operator = operator.strip()
+        if not operator:
+            raise DomainError("必须填写锁定人")
+        region = region.strip()
+        with self.transaction():
+            current = self.get_lock(air_date, region)
+            if current:
+                raise DomainError("节目单已经是锁定状态，无需重复锁定")
+            created_at = datetime.now().isoformat(timespec="seconds")
+            cur = self.conn.execute(
+                "INSERT INTO schedule_lock_events(air_date,region,action,operator,reason,created_at) "
+                "VALUES(?,?, 'locked', ?, '', ?)",
+                (air_date, region, operator, created_at),
+            )
+        return self.get_lock(air_date, region) | {"event_id": int(cur.lastrowid)}
+
+    def unlock_schedule(self, air_date: str, region: str, operator: str, reason: str) -> dict:
+        self._validate_lock_target(air_date, region)
+        operator = operator.strip()
+        reason = reason.strip()
+        if not operator:
+            raise DomainError("必须填写解锁人")
+        if not reason:
+            raise DomainError("解锁必须填写原因")
+        region = region.strip()
+        with self.transaction():
+            current = self.get_lock(air_date, region)
+            if not current:
+                raise DomainError("节目单未锁定，无需解锁")
+            created_at = datetime.now().isoformat(timespec="seconds")
+            self.conn.execute(
+                "INSERT INTO schedule_lock_events(air_date,region,action,operator,reason,created_at) "
+                "VALUES(?,?, 'unlocked', ?, ?, ?)",
+                (air_date, region, operator, reason, created_at),
+            )
+        return {"air_date": air_date, "region": region, "locked": False, "operator": operator,
+                "unlocked_at": created_at, "reason": reason}
+
+    def get_lock(self, air_date: str, region: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM schedule_lock_events WHERE air_date=? AND region=? ORDER BY id DESC LIMIT 1",
+            (air_date, region.strip()),
+        ).fetchone()
+        if not row or row["action"] != "locked":
+            return None
+        return {
+            "air_date": row["air_date"],
+            "region": row["region"],
+            "locked": True,
+            "operator": row["operator"],
+            "locked_at": row["created_at"],
+            "event_id": row["id"],
+        }
+
+    def list_locks(self) -> list[dict]:
+        """Currently locked date/region targets (latest event must be 'locked')."""
+        rows = self.conn.execute(
+            "SELECT e.* FROM schedule_lock_events e JOIN ("
+            "  SELECT air_date, region, MAX(id) AS max_id FROM schedule_lock_events GROUP BY air_date, region"
+            ") latest ON latest.max_id = e.id WHERE e.action='locked' ORDER BY e.air_date, e.region"
+        ).fetchall()
+        return [{
+            "air_date": row["air_date"], "region": row["region"], "locked": True,
+            "operator": row["operator"], "locked_at": row["created_at"], "event_id": row["id"],
+        } for row in rows]
+
+    def list_lock_history(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM schedule_lock_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_playout(self, slot_id: int, actual_start: str, actual_duration_minutes: int,
                        actual_program_id: int | None = None, note: str = "") -> int:
@@ -361,6 +470,17 @@ class RadioDB:
         slots = [dict(row) for row in self.conn.execute(
             "SELECT s.*, p.title, p.kind FROM slots s JOIN programs p ON p.id=s.program_id ORDER BY s.air_date,s.start_time"
         ).fetchall()]
-        return {"programs": programs, "slots": slots, "exceptions": [dict(row) for row in self.conn.execute(
-            "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
-        ).fetchall()]}
+        locks = self.list_locks()
+        locked_targets = {(lock["air_date"], lock["region"]) for lock in locks}
+        for slot in slots:
+            slot["locked"] = (slot["air_date"], slot["region"]) in locked_targets
+        return {
+            "programs": programs,
+            "slots": slots,
+            "locks": locks,
+            "lock_history": self.list_lock_history(),
+            "recent_lock_actions": self.list_lock_history(10),
+            "exceptions": [dict(row) for row in self.conn.execute(
+                "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
+            ).fetchall()],
+        }
