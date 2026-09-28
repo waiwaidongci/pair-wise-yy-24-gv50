@@ -119,6 +119,17 @@ class RadioDB:
               created_at TEXT NOT NULL,
               UNIQUE(air_date, slot_id, kind)
             );
+            CREATE TABLE IF NOT EXISTS schedule_lock_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              air_date TEXT NOT NULL,
+              region TEXT NOT NULL,
+              action TEXT NOT NULL CHECK(action IN ('locked','unlocked')),
+              operator TEXT NOT NULL,
+              reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lock_events_pair
+              ON schedule_lock_events(air_date, region, id);
             """
         )
         self.conn.commit()
@@ -262,6 +273,7 @@ class RadioDB:
         if not program:
             raise DomainError("节目不存在")
         with self.transaction():
+            self._ensure_unlocked(air_date, region)
             self._validate_slot(air_date, start_time, int(program["duration_minutes"]), program_id, region)
             cur = self.conn.execute(
                 "INSERT INTO slots(air_date,start_time,duration_minutes,program_id,region,created_at) VALUES(?,?,?,?,?,?)",
@@ -275,6 +287,7 @@ class RadioDB:
             slot = self.conn.execute("SELECT * FROM slots WHERE id=? AND status='planned'", (slot_id,)).fetchone()
             if not slot:
                 raise DomainError("只能替换尚未播出且状态为 planned 的排期")
+            self._ensure_unlocked(slot["air_date"], slot["region"])
             program = self.conn.execute("SELECT * FROM programs WHERE id=?", (new_program_id,)).fetchone()
             if not program:
                 raise DomainError("替换节目不存在")
@@ -356,11 +369,155 @@ class RadioDB:
             "SELECT * FROM reconciliation_exceptions WHERE air_date=? ORDER BY slot_id, kind", (air_date,)
         ).fetchall()]
 
+    def _validate_pair(self, air_date: str, region: str) -> tuple[str, str]:
+        try:
+            datetime.strptime(air_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+        if not region.strip():
+            raise DomainError("地区不能为空")
+        return air_date, region.strip()
+
+    def _latest_event(self, air_date: str, region: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM schedule_lock_events WHERE air_date=? AND region=? ORDER BY id DESC LIMIT 1",
+            (air_date, region),
+        ).fetchone()
+
+    def _ensure_unlocked(self, air_date: str, region: str) -> None:
+        """Reject plan mutations for a date+region whose reviewed plan is locked."""
+        latest = self._latest_event(air_date, region)
+        if latest and latest["action"] == "locked":
+            raise DomainError(
+                f"{air_date} {region} 的节目单已锁定，原安排不能动；"
+                f"如需调整请先解锁（锁定人：{latest['operator']}）"
+            )
+
+    def lock_schedule(self, air_date: str, region: str, operator: str) -> dict:
+        """Lock the reviewed plan for a date and region; idempotent re-lock is rejected."""
+        air_date, region = self._validate_pair(air_date, region)
+        if not operator.strip():
+            raise DomainError("锁定人不能为空")
+        with self.transaction():
+            latest = self._latest_event(air_date, region)
+            if latest and latest["action"] == "locked":
+                raise DomainError("该节目单已是锁定状态，无需重复锁定")
+            created_at = datetime.now().isoformat()
+            cur = self.conn.execute(
+                "INSERT INTO schedule_lock_events(air_date,region,action,operator,reason,created_at) "
+                "VALUES(?,?, 'locked', ?, '', ?)",
+                (air_date, region, operator.strip(), created_at),
+            )
+            event = dict(self.conn.execute(
+                "SELECT * FROM schedule_lock_events WHERE id=?", (cur.lastrowid,)
+            ).fetchone())
+        return event
+
+    def unlock_schedule(self, air_date: str, region: str, operator: str, reason: str) -> dict:
+        """Unlock with a mandatory reason; the prior locked record stays in history."""
+        air_date, region = self._validate_pair(air_date, region)
+        if not operator.strip():
+            raise DomainError("解锁人不能为空")
+        if not reason.strip():
+            raise DomainError("解锁必须填写原因")
+        with self.transaction():
+            latest = self._latest_event(air_date, region)
+            if not latest or latest["action"] != "locked":
+                raise DomainError("节目单未锁定，无需解锁")
+            created_at = datetime.now().isoformat()
+            cur = self.conn.execute(
+                "INSERT INTO schedule_lock_events(air_date,region,action,operator,reason,created_at) "
+                "VALUES(?,?, 'unlocked', ?, ?, ?)",
+                (air_date, region, operator.strip(), reason.strip(), created_at),
+            )
+            event = dict(self.conn.execute(
+                "SELECT * FROM schedule_lock_events WHERE id=?", (cur.lastrowid,)
+            ).fetchone())
+        return event
+
+    def lock_status(self, air_date: str, region: str) -> dict | None:
+        air_date, region = self._validate_pair(air_date, region)
+        latest = self._latest_event(air_date, region)
+        if not latest:
+            return {"air_date": air_date, "region": region, "locked": False}
+        locked = latest["action"] == "locked"
+        status: dict = {
+            "air_date": air_date,
+            "region": region,
+            "locked": locked,
+            "latest_event_id": latest["id"],
+            "updated_at": latest["created_at"],
+            "updated_by": latest["operator"],
+        }
+        if locked:
+            status["locked_at"] = latest["created_at"]
+            status["locked_by"] = latest["operator"]
+        else:
+            status["unlocked_at"] = latest["created_at"]
+            status["unlocked_by"] = latest["operator"]
+            status["unlock_reason"] = latest["reason"]
+            locked_event = self.conn.execute(
+                "SELECT * FROM schedule_lock_events WHERE air_date=? AND region=? AND action='locked' "
+                "ORDER BY id DESC LIMIT 1",
+                (air_date, region),
+            ).fetchone()
+            if locked_event:
+                status["last_locked_at"] = locked_event["created_at"]
+                status["last_locked_by"] = locked_event["operator"]
+        return status
+
+    def lock_events(self, air_date: str | None = None, region: str | None = None,
+                    limit: int = 50) -> list[dict]:
+        sql = "SELECT * FROM schedule_lock_events"
+        clauses: list[str] = []
+        params: list[object] = []
+        if air_date:
+            try:
+                datetime.strptime(air_date, "%Y-%m-%d")
+            except ValueError as exc:
+                raise DomainError("日期必须使用 YYYY-MM-DD") from exc
+            clauses.append("air_date=?")
+            params.append(air_date)
+        if region and region.strip():
+            clauses.append("region=?")
+            params.append(region.strip())
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def lock_states(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT e.* FROM schedule_lock_events e
+            JOIN (SELECT air_date, region, MAX(id) AS max_id
+                  FROM schedule_lock_events GROUP BY air_date, region) m
+              ON e.id = m.max_id
+            ORDER BY e.air_date, e.region
+            """
+        ).fetchall()
+        states = []
+        for row in rows:
+            states.append({
+                "air_date": row["air_date"],
+                "region": row["region"],
+                "locked": row["action"] == "locked",
+                "locked_by": row["operator"] if row["action"] == "locked" else None,
+                "locked_at": row["created_at"] if row["action"] == "locked" else None,
+                "updated_by": row["operator"],
+                "updated_at": row["created_at"],
+            })
+        return states
+
     def snapshot(self) -> dict:
         programs = [dict(row) for row in self.conn.execute("SELECT * FROM programs ORDER BY id").fetchall()]
         slots = [dict(row) for row in self.conn.execute(
             "SELECT s.*, p.title, p.kind FROM slots s JOIN programs p ON p.id=s.program_id ORDER BY s.air_date,s.start_time"
         ).fetchall()]
-        return {"programs": programs, "slots": slots, "exceptions": [dict(row) for row in self.conn.execute(
+        return {"programs": programs, "slots": slots,
+                "lock_states": self.lock_states(),
+                "lock_events": self.lock_events(limit=50),
+                "exceptions": [dict(row) for row in self.conn.execute(
             "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
         ).fetchall()]}

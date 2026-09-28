@@ -57,6 +57,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not date:
                     raise DomainError("缺少 date 参数")
                 return self._json(200, {"exceptions": self.db.get_exceptions(date)})
+            if parsed.path == "/api/locks":
+                query = parse_qs(parsed.query)
+                date = query.get("date", [""])[0]
+                region = query.get("region", [""])[0]
+                if not date or not region:
+                    raise DomainError("缺少 date 或 region 参数")
+                return self._json(200, {
+                    "status": self.db.lock_status(date, region),
+                    "events": self.db.lock_events(date, region),
+                })
             self._json(404, {"ok": False, "error": "接口不存在"})
         except DomainError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -90,6 +100,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/locks/lock":
+                event = self.db.lock_schedule(
+                    str(body.get("air_date", "")), str(body.get("region", "")),
+                    str(body.get("operator", "")),
+                )
+                return self._json(201, {"ok": True, "event": event})
+            if parsed.path == "/api/locks/unlock":
+                event = self.db.unlock_schedule(
+                    str(body.get("air_date", "")), str(body.get("region", "")),
+                    str(body.get("operator", "")), str(body.get("reason", "")),
+                )
+                return self._json(200, {"ok": True, "event": event})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":

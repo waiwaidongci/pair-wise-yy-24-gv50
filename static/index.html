@@ -6,30 +6,98 @@
 body{font:15px system-ui;max-width:1100px;margin:24px auto;padding:0 16px;background:#f7f7f5;color:#222}
 section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
-button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
+button{cursor:pointer;background:#16324f;color:white}
+button.unlock{background:#8a3b12}
+pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-weight:bold}
+.badge.locked{background:#fde2e2;color:#8a1f1f;border:1px solid #e0a0a0}
+.badge.open{background:#e2f0e2;color:#1f6a1f;border:1px solid #a0d0a0}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+td,th{border:1px solid #ddd;padding:5px 8px;text-align:left;font-size:13px}
+th{background:#f0f0ee}
+.muted{color:#777}
 </style>
 <h1>电台播出与版权窗口排程</h1>
-<section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
+<section><h2>当前计划 <button onclick="load()">刷新</button></h2><pre id="state"></pre></section>
 <section><h2>新建节目</h2><div class="grid">
 <input id="title" placeholder="节目名"><select id="kind"><option>music</option><option>ad</option><option>talk</option><option>live</option></select>
 <input id="duration" type="number" value="30" placeholder="分钟"><input id="start" value="2026-01-01"><input id="end" value="2026-12-31">
 <input id="region" value="华东"><input id="sponsor" placeholder="赞助商，可空"><input id="cooldown" type="number" value="0" placeholder="冷却分钟">
 </div><button onclick="addProgram()">创建并授权地区</button></section>
+<section><h2>节目单锁定</h2>
+<div class="grid">
+<input id="lockdate" value="2026-09-28" onchange="renderLocks()">
+<input id="lockregion" value="华东" onchange="renderLocks()">
+<input id="operator" placeholder="操作人（值班员姓名）">
+</div>
+<input id="unlockreason" style="width:60%" placeholder="解锁原因（解锁必填，原锁定记录仍保留）">
+<div style="margin-top:6px">
+<button onclick="lockPlan()">锁定已审核节目单</button>
+<button class="unlock" onclick="unlockPlan()">解锁并填写原因</button>
+</div>
+<h3>当前选择的日期 / 地区</h3><div id="lockstatus" class="muted">加载中…</div>
+<h3>锁定状态一览</h3><div id="lockstates" class="muted">—</div>
+<h3>锁定 / 解锁历史（最近操作）</h3><div id="lockhistory" class="muted">—</div>
+</section>
 <section><h2>排期 / 替换 / 实播对账</h2>
 <div class="grid"><input id="airdate" value="2026-09-28"><input id="starttime" value="12:00"><input id="pid" type="number" placeholder="节目 ID">
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
 <input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
 <button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
 <script>
-const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
+let snapshot=null;
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
-async function load(){document.querySelector('#state').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+async function api(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();
+  out(j);
+  if(j.ok!==false) await load();
+  return j;
+}
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function fmtTime(iso){return iso?iso.replace('T',' ').slice(0,19):''}
+async function load(){
+  snapshot=await (await fetch('/api/state')).json();
+  document.querySelector('#state').textContent=JSON.stringify(snapshot,null,2);
+  renderLocks();
+}
+function renderLocks(){
+  if(!snapshot)return;
+  const date=lockdate.value, region=lockregion.value;
+  const states=snapshot.lock_states||[], events=snapshot.lock_events||[];
+  const cur=states.find(s=>s.air_date===date&&s.region===region);
+  if(cur&&cur.locked){
+    lockstatus.innerHTML='<span class="badge locked">已锁定</span> 锁定人：'+esc(cur.locked_by)+
+      '　锁定时间：'+esc(fmtTime(cur.locked_at))+
+      '<div class="muted">锁定后新建或替换该地区节目会被拒绝，实播登记照常。</div>';
+  }else if(cur){
+    lockstatus.innerHTML='<span class="badge open">未锁定</span> 最近解锁人：'+esc(cur.updated_by)+
+      '　解锁时间：'+esc(fmtTime(cur.updated_at))+'　<div class="muted">解锁后可调整安排，调整完可重新锁定。</div>';
+  }else{
+    lockstatus.innerHTML='<span class="muted">该日期 / 地区尚无锁定记录（未锁定）</span>';
+  }
+  lockstates.innerHTML=states.length?('<table><tr><th>日期</th><th>地区</th><th>状态</th><th>操作人</th><th>时间</th></tr>'+
+    states.map(s=>'<tr><td>'+esc(s.air_date)+'</td><td>'+esc(s.region)+'</td><td>'+
+      (s.locked?'<span class="badge locked">已锁定</span>':'<span class="badge open">未锁定</span>')+
+      '</td><td>'+esc(s.updated_by)+'</td><td>'+esc(fmtTime(s.updated_at))+'</td></tr>').join('')+'</table>')
+    :'<span class="muted">暂无任何锁定记录</span>';
+  lockhistory.innerHTML=events.length?('<table><tr><th>时间</th><th>日期</th><th>地区</th><th>操作</th><th>操作人</th><th>原因</th></tr>'+
+    events.map(e=>'<tr><td>'+esc(fmtTime(e.created_at))+'</td><td>'+esc(e.air_date)+'</td><td>'+esc(e.region)+
+      '</td><td>'+(e.action==='locked'?'<span class="badge locked">锁定</span>':'<span class="badge open">解锁</span>')+
+      '</td><td>'+esc(e.operator)+'</td><td>'+esc(e.reason)+'</td></tr>').join('')+'</table>')
+    :'<span class="muted">暂无操作历史</span>';
+}
 function addProgram(){api('/api/programs',{title:title.value,kind:kind.value,duration_minutes:+duration.value,start_date:start.value,end_date:end.value,region:region.value,regions:[region.value],sponsor:sponsor.value||null,cooldown_minutes:+cooldown.value})}
 function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:starttime.value,program_id:+pid.value,region:region.value})}
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
-function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
+function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+function lockPlan(){api('/api/locks/lock',{air_date:lockdate.value,region:lockregion.value,operator:operator.value})}
+function unlockPlan(){
+  api('/api/locks/unlock',{air_date:lockdate.value,region:lockregion.value,operator:operator.value,reason:unlockreason.value})
+    .then(j=>{if(j.ok!==false)unlockreason.value=''});
+}
 load();
 </script>
 </html>
